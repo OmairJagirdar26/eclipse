@@ -1102,6 +1102,61 @@ public class HttpClientTest extends AbstractHttpClientServerTest
 
     @ParameterizedTest
     @ArgumentsSource(ScenarioProvider.class)
+    public void testX(Scenario scenario) throws Exception
+    {
+        start(scenario, new Handler.Processor()
+        {
+            @Override
+            public void process(org.eclipse.jetty.server.Request request, org.eclipse.jetty.server.Response response, Callback callback)
+            {
+                response.write(true, ByteBuffer.wrap("hello".getBytes(UTF_8)), callback);
+            }
+        });
+
+        CountDownLatch latch = new CountDownLatch(1);
+        Response.ContentSourceListener newContentListener = new Response.ContentSourceListener()
+        {
+            @Override
+            public void onContentSource(Response response, Content.Source contentSource)
+            {
+                latch.countDown();
+                while (true)
+                {
+                    Content.Chunk chunk = contentSource.read();
+                    if (chunk == null)
+                    {
+                        contentSource.demand(() -> onContentSource(response, contentSource));
+                        return;
+                    }
+                    if (chunk instanceof Content.Chunk.Error error)
+                    {
+                        response.abort(error.getCause());
+                        return;
+                    }
+
+                    // handle chunk: chunk.getByteBuffer() ...
+
+                    chunk.release();
+                }
+            }
+        };
+        BufferingResponseListener bufferingResponseListener = new BufferingResponseListener()
+        {
+            @Override
+            public void onComplete(Result result)
+            {
+                latch.countDown();
+            }
+        };
+        client.newRequest("localhost", connector.getLocalPort())
+            .scheme(scenario.getScheme())
+            .send(bufferingResponseListener);
+//            .send(newContentListener, false);
+        latch.await();
+    }
+
+    @ParameterizedTest
+    @ArgumentsSource(ScenarioProvider.class)
     public void setOnCompleteCallbackWithBlockingSend(Scenario scenario) throws Exception
     {
         byte[] content = new byte[512];

@@ -23,6 +23,7 @@ import org.eclipse.jetty.client.util.BufferingResponseListener;
 import org.eclipse.jetty.http.HttpField;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpVersion;
+import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.util.Callback;
 
 /**
@@ -166,6 +167,7 @@ public interface Response
      *
      * @see DemandedContentListener
      */
+    @Deprecated
     interface AsyncContentListener extends DemandedContentListener
     {
         /**
@@ -193,6 +195,7 @@ public interface Response
     /**
      * Asynchronous listener for the response content events.
      */
+    @Deprecated
     interface DemandedContentListener extends ResponseListener
     {
         /**
@@ -223,6 +226,11 @@ public interface Response
          * @param callback the callback to call when the content is consumed
          */
         void onContent(Response response, LongConsumer demand, ByteBuffer content, Callback callback);
+    }
+
+    interface ContentSourceListener extends ResponseListener
+    {
+        void onContentSource(Response response, Content.Source contentSource);
     }
 
     /**

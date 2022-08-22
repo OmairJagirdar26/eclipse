@@ -409,12 +409,14 @@ public interface Request
      * @param listener an asynchronous listener for response content events
      * @return this request object
      */
+    @Deprecated
     Request onResponseContentAsync(Response.AsyncContentListener listener);
 
     /**
      * @param listener an asynchronous listener for response content events
      * @return this request object
      */
+    @Deprecated
     Request onResponseContentDemanded(Response.DemandedContentListener listener);
 
     /**
@@ -466,6 +468,8 @@ public interface Request
      * @param listener the listener that receives response events
      */
     void send(Response.CompleteListener listener);
+
+    void send(Response.ContentSourceListener contentSourceListener, boolean ignore); // TODO get rid of boolean, it's there just to avoid signature clashes when send(null) is called
 
     /**
      * Attempts to abort the send of this request.

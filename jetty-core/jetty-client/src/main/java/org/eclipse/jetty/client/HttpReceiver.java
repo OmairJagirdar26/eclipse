@@ -648,6 +648,7 @@ public abstract class HttpReceiver
         private final Map<Object, Long> demands = new ConcurrentHashMap<>();
         private final LongConsumer demand = HttpReceiver.this::demand;
         private final List<Response.DemandedContentListener> listeners = new ArrayList<>(2);
+        private Response.ContentSourceListener contentSourceListener;
 
         private void clear()
         {
@@ -662,6 +663,8 @@ public abstract class HttpReceiver
             {
                 if (listener instanceof Response.DemandedContentListener)
                     listeners.add((Response.DemandedContentListener)listener);
+                if (listener instanceof Response.ContentSourceListener csl)
+                    contentSourceListener = csl;
             }
         }
 
@@ -674,8 +677,11 @@ public abstract class HttpReceiver
         {
             if (isEmpty())
             {
+                if (contentSourceListener == null)
                 // If no listeners, we want to proceed and consume any content.
-                demand.accept(1);
+                    demand.accept(1);
+                else
+                    contentSourceListener.onContentSource(response, null);
             }
             else
             {
