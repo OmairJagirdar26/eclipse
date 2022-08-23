@@ -25,7 +25,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.LongConsumer;
 import java.util.function.LongUnaryOperator;
 
 import org.eclipse.jetty.client.api.Response;
@@ -33,6 +32,7 @@ import org.eclipse.jetty.client.api.Result;
 import org.eclipse.jetty.http.HttpField;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpStatus;
+import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.util.BufferUtil;
 import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.MathUtils;
@@ -78,6 +78,8 @@ public abstract class HttpReceiver
     private Throwable failure;
     private long demand;
     private boolean stalled;
+    private Runnable demandCallback;
+    private Content.Chunk demandedContent;
 
     protected HttpReceiver(HttpChannel channel)
     {
@@ -105,6 +107,34 @@ public abstract class HttpReceiver
             }
             if (LOG.isDebugEnabled())
                 LOG.debug("Response demand={}/{}, resume={} on {}", n, demand, resume, this);
+        }
+
+        if (resume)
+        {
+            if (decoder != null)
+                decoder.resume();
+            else
+                receive();
+        }
+    }
+
+    void demandStrictlyOne()
+    {
+        boolean resume = false;
+        try (AutoLock ignored = lock.lock())
+        {
+            if (demand == 1)
+                return;
+            if (demand > 1)
+                throw new IllegalStateException();
+            demand = 1;
+            if (stalled)
+            {
+                stalled = false;
+                resume = true;
+            }
+            if (LOG.isDebugEnabled())
+                LOG.debug("Response demand={}/{}, resume={} on {}", 1, demand, resume, this);
         }
 
         if (resume)
@@ -286,33 +316,44 @@ public abstract class HttpReceiver
         List<Response.ResponseListener> responseListeners = exchange.getConversation().getResponseListeners();
         notifier.notifyHeaders(responseListeners, response);
         contentListeners.reset(responseListeners);
-        contentListeners.notifyBeforeContent(response);
-
-        if (!contentListeners.isEmpty())
+        if (!contentListeners.hasContentSourceListener())
         {
-            List<String> contentEncodings = response.getHeaders().getCSV(HttpHeader.CONTENT_ENCODING.asString(), false);
-            if (contentEncodings != null && !contentEncodings.isEmpty())
+            contentListeners.notifyBeforeContent(response);
+
+            if (!contentListeners.isEmpty())
             {
-                for (ContentDecoder.Factory factory : getHttpDestination().getHttpClient().getContentDecoderFactories())
+                List<String> contentEncodings = response.getHeaders().getCSV(HttpHeader.CONTENT_ENCODING.asString(), false);
+                if (contentEncodings != null && !contentEncodings.isEmpty())
                 {
-                    for (String encoding : contentEncodings)
+                    for (ContentDecoder.Factory factory : getHttpDestination().getHttpClient().getContentDecoderFactories())
                     {
-                        if (factory.getEncoding().equalsIgnoreCase(encoding))
+                        for (String encoding : contentEncodings)
                         {
-                            decoder = new Decoder(exchange, factory.newContentDecoder());
-                            break;
+                            if (factory.getEncoding().equalsIgnoreCase(encoding))
+                            {
+                                decoder = new Decoder(exchange, factory.newContentDecoder());
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if (updateResponseState(ResponseState.TRANSIENT, ResponseState.HEADERS))
+            if (updateResponseState(ResponseState.TRANSIENT, ResponseState.HEADERS))
+            {
+                boolean hasDemand = hasDemandOrStall();
+                if (LOG.isDebugEnabled())
+                    LOG.debug("Response headers hasDemand={} {}", hasDemand, response);
+                return hasDemand;
+            }
+        }
+        else
         {
-            boolean hasDemand = hasDemandOrStall();
-            if (LOG.isDebugEnabled())
-                LOG.debug("Response headers hasDemand={} {}", hasDemand, response);
-            return hasDemand;
+            if (updateResponseState(ResponseState.TRANSIENT, ResponseState.HEADERS))
+            {
+                contentListeners.useContentSourceListener(response);
+                return responseState.get() != ResponseState.FAILURE;
+            }
         }
 
         dispose();
@@ -339,6 +380,17 @@ public abstract class HttpReceiver
             callback.failed(new IllegalStateException("No demand for response content"));
             return false;
         }
+
+        if (demandCallback != null)
+        {
+            demand(d -> d - 1);
+            Runnable demandCb = demandCallback;
+            demandCallback = null;
+            demandedContent = Content.Chunk.from(buffer, false, callback::succeeded);
+            demandCb.run();
+            return demandCallback != null;
+        }
+
         if (decoder == null)
             return plainResponseContent(exchange, buffer, callback);
         else
@@ -646,9 +698,51 @@ public abstract class HttpReceiver
     private class ContentListeners
     {
         private final Map<Object, Long> demands = new ConcurrentHashMap<>();
-        private final LongConsumer demand = HttpReceiver.this::demand;
         private final List<Response.DemandedContentListener> listeners = new ArrayList<>(2);
         private Response.ContentSourceListener contentSourceListener;
+
+        public boolean hasContentSourceListener()
+        {
+            return contentSourceListener != null;
+        }
+
+        public void useContentSourceListener(HttpResponse response)
+        {
+            contentSourceListener.onContentSource(response, new Content.Source() {
+                private Content.Chunk.Error error;
+
+                @Override
+                public Content.Chunk read()
+                {
+                    if (error != null)
+                        return error;
+                    Content.Chunk c = demandedContent;
+                    demandedContent = null;
+                    return c;
+                }
+
+                @Override
+                public void demand(Runnable demandCb)
+                {
+                    if (demandCallback != null)
+                        throw new IllegalStateException();
+                    demandCallback = demandCb;
+                    demandStrictlyOne();
+                }
+
+                @Override
+                public void fail(Throwable failure)
+                {
+                    if (demandedContent != null)
+                    {
+                        demandedContent.release();
+                        demandedContent = null;
+                    }
+                    error = Content.Chunk.from(failure);
+                    responseFailure(failure);
+                }
+            });
+        }
 
         private void clear()
         {
@@ -677,11 +771,8 @@ public abstract class HttpReceiver
         {
             if (isEmpty())
             {
-                if (contentSourceListener == null)
                 // If no listeners, we want to proceed and consume any content.
-                    demand.accept(1);
-                else
-                    contentSourceListener.onContentSource(response, null);
+                HttpReceiver.this.demand(1);
             }
             else
             {
@@ -702,7 +793,7 @@ public abstract class HttpReceiver
             if (listeners.size() > 1)
                 accept(context, value);
             else
-                demand.accept(value);
+                HttpReceiver.this.demand(value);
         }
 
         private void accept(Object context, long value)
@@ -736,7 +827,7 @@ public abstract class HttpReceiver
                     }
 
                     // Demand more content chunks for all the listeners.
-                    demand.accept(minDemand);
+                    HttpReceiver.this.demand(minDemand);
                 }
             }
         }

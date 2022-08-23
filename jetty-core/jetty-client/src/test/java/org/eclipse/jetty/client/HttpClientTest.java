@@ -1102,7 +1102,7 @@ public class HttpClientTest extends AbstractHttpClientServerTest
 
     @ParameterizedTest
     @ArgumentsSource(ScenarioProvider.class)
-    public void testX(Scenario scenario) throws Exception
+    public void testContentSourceListener(Scenario scenario) throws Exception
     {
         start(scenario, new Handler.Processor()
         {
@@ -1114,12 +1114,11 @@ public class HttpClientTest extends AbstractHttpClientServerTest
         });
 
         CountDownLatch latch = new CountDownLatch(1);
-        Response.ContentSourceListener newContentListener = new Response.ContentSourceListener()
+        Response.ContentSourceListener contentSourceListener = new Response.ContentSourceListener()
         {
             @Override
             public void onContentSource(Response response, Content.Source contentSource)
             {
-                latch.countDown();
                 while (true)
                 {
                     Content.Chunk chunk = contentSource.read();
@@ -1135,6 +1134,7 @@ public class HttpClientTest extends AbstractHttpClientServerTest
                     }
 
                     // handle chunk: chunk.getByteBuffer() ...
+                    latch.countDown();
 
                     chunk.release();
                 }
@@ -1150,8 +1150,8 @@ public class HttpClientTest extends AbstractHttpClientServerTest
         };
         client.newRequest("localhost", connector.getLocalPort())
             .scheme(scenario.getScheme())
-            .send(bufferingResponseListener);
-//            .send(newContentListener, false);
+//            .send(bufferingResponseListener);
+            .send(contentSourceListener, false);
         latch.await();
     }
 
