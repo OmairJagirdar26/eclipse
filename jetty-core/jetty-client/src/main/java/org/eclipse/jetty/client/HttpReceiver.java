@@ -55,7 +55,7 @@ import org.slf4j.LoggerFactory;
  * is available</li>
  * <li>{@link #responseHeader(HttpExchange, HttpField)}, when an HTTP field is available</li>
  * <li>{@link #responseHeaders(HttpExchange)}, when all HTTP headers are available</li>
- * <li>{@link #responseContent(HttpExchange, ByteBuffer, Callback)}, when HTTP content is available</li>
+ * <li>{@link #responseContent(HttpExchange, Content.Chunk, Callback)}, when HTTP content is available</li>
  * <li>{@link #responseSuccess(HttpExchange)}, when the response is successful</li>
  * </ol>
  * At any time, subclasses may invoke {@link #responseFailure(Throwable)} to indicate that the response has failed
@@ -393,14 +393,14 @@ public abstract class HttpReceiver
      * This method takes case of decoding the content, if necessary, and notifying {@link org.eclipse.jetty.client.api.Response.ContentListener}s.
      *
      * @param exchange the HTTP exchange
-     * @param buffer the response HTTP content buffer
+     * @param chunk the response HTTP content chunk
      * @param callback the callback
      * @return whether the processing should continue
      */
-    protected boolean responseContent(HttpExchange exchange, ByteBuffer buffer, Callback callback)
+    protected boolean responseContent(HttpExchange exchange, Content.Chunk chunk, Callback callback)
     {
         if (LOG.isDebugEnabled())
-            LOG.debug("Response content {}{}{}", exchange.getResponse(), System.lineSeparator(), BufferUtil.toDetailString(buffer));
+            LOG.debug("Response content {}{}{}", exchange.getResponse(), System.lineSeparator(), BufferUtil.toDetailString(chunk.getByteBuffer()));
 
         if (contentListeners.hasContentSourceListener())
         {
@@ -410,7 +410,7 @@ public abstract class HttpReceiver
                 return false;
             }
 
-            contentSource.write(Content.Chunk.from(buffer, false), callback); // TODO link chunk to callback.succeed without calling it twice
+            contentSource.write(chunk, callback);
             contentListeners.callContentSourceListener(exchange.getResponse());
 
             if (updateResponseState(ResponseState.TRANSIENT, ResponseState.CONTENT))
@@ -430,10 +430,15 @@ public abstract class HttpReceiver
                 return false;
             }
 
+            Callback c = Callback.from(chunk::release, (x) ->
+            {
+                chunk.release();
+                callback.failed(x);
+            });
             if (decoder == null)
-                return plainResponseContent(exchange, buffer, callback);
+                return plainResponseContent(exchange, chunk.getByteBuffer(), c);
             else
-                return decodeResponseContent(buffer, callback);
+                return decodeResponseContent(chunk.getByteBuffer(), c);
         }
     }
 

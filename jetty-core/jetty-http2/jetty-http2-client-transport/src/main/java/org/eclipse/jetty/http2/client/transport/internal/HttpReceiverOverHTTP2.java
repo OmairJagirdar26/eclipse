@@ -38,6 +38,7 @@ import org.eclipse.jetty.http2.frames.ResetFrame;
 import org.eclipse.jetty.http2.internal.ErrorCode;
 import org.eclipse.jetty.http2.internal.HTTP2Channel;
 import org.eclipse.jetty.http2.internal.HTTP2Stream;
+import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.io.EndPoint;
 import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.thread.Invocable;
@@ -217,14 +218,15 @@ public class HttpReceiverOverHTTP2 extends HttpReceiver implements HTTP2Channel.
                 if (data.frame().isEndStream())
                     notifySuccess = true;
 
-                Callback callback = Callback.from(Invocable.InvocationType.NON_BLOCKING, data::release, x ->
+                Callback callback = Callback.from(Invocable.InvocationType.NON_BLOCKING, () -> {}, x ->
                 {
                     data.release();
                     if (responseFailure(x))
                         stream.reset(new ResetFrame(stream.getId(), ErrorCode.CANCEL_STREAM_ERROR.code), Callback.NOOP);
                 });
 
-                boolean proceed = responseContent(exchange, byteBuffer, callback);
+                Content.Chunk chunk = Content.Chunk.from(byteBuffer, data.frame().isEndStream(), data::release);
+                boolean proceed = responseContent(exchange, chunk, callback);
                 if (proceed)
                 {
                     if (data.frame().isEndStream())

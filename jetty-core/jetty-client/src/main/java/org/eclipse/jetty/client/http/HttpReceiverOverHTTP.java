@@ -29,6 +29,7 @@ import org.eclipse.jetty.http.HttpMethod;
 import org.eclipse.jetty.http.HttpParser;
 import org.eclipse.jetty.http.HttpStatus;
 import org.eclipse.jetty.http.HttpVersion;
+import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.io.EndPoint;
 import org.eclipse.jetty.io.RetainableByteBuffer;
 import org.eclipse.jetty.io.RetainableByteBufferPool;
@@ -340,16 +341,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
 
         RetainableByteBuffer networkBuffer = this.networkBuffer;
         networkBuffer.retain();
-        return !responseContent(exchange, buffer, Callback.from(networkBuffer::release, failure ->
-        {
-            networkBuffer.release();
-            failAndClose(failure);
-        }));
-        // TODO
-//        return !responseContent(exchange, Content.Chunk.from(networkBuffer.getBuffer(), false, networkBuffer), Callback.from(()->{}, failure ->
-//        {
-//            failAndClose(failure);
-//        }));
+        return !responseContent(exchange, Content.Chunk.from(buffer, false, networkBuffer), Callback.from(() -> {}, this::failAndClose));
     }
 
     @Override
