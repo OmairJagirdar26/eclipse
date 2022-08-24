@@ -345,6 +345,11 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
             networkBuffer.release();
             failAndClose(failure);
         }));
+        // TODO
+//        return !responseContent(exchange, Content.Chunk.from(networkBuffer.getBuffer(), false, networkBuffer), Callback.from(()->{}, failure ->
+//        {
+//            failAndClose(failure);
+//        }));
     }
 
     @Override

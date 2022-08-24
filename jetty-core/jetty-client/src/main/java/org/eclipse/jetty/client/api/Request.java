@@ -469,6 +469,7 @@ public interface Request
      */
     void send(Response.CompleteListener listener);
 
+    // TODO should either contain or be a ContentSourceListener
     void send(Response.ContentSourceListener contentSourceListener, boolean ignore); // TODO get rid of boolean, it's there just to avoid signature clashes when send(null) is called
 
     /**
