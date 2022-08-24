@@ -384,24 +384,35 @@ public abstract class HttpReceiver
             return false;
         }
 
-        if (contentSource.setContentAndRunDemandCallbackIfSet(Content.Chunk.from(buffer, false, callback::succeeded)))
+        if (contentListeners.hasContentSourceListener())
         {
-//            if (updateResponseState(ResponseState.HEADERS, ResponseState.CONTENT, ResponseState.TRANSIENT))
-//            {
-            boolean hasDemand = hasDemandOrStall();
-            if (LOG.isDebugEnabled())
-                LOG.debug("Response content {}, hasDemand={}", exchange.getResponse(), hasDemand);
-            return hasDemand;
-//            }
-//            dispose();
-//            terminateResponse(exchange);
-//            return false;
-        }
+            if (!updateResponseState(ResponseState.HEADERS, ResponseState.CONTENT, ResponseState.TRANSIENT))
+            {
+                callback.failed(new IllegalStateException("Invalid response state " + responseState));
+                return false;
+            }
 
-        if (decoder == null)
-            return plainResponseContent(exchange, buffer, callback);
+            contentSource.setContentAndRunDemandCallbackIfSet(Content.Chunk.from(buffer, false, callback::succeeded));
+
+            if (updateResponseState(ResponseState.TRANSIENT, ResponseState.CONTENT))
+            {
+                boolean hasDemand = hasDemandOrStall();
+                if (LOG.isDebugEnabled())
+                    LOG.debug("Response content {}, hasDemand={}", exchange.getResponse(), hasDemand);
+                return hasDemand;
+            }
+
+            dispose();
+            terminateResponse(exchange);
+            return false;
+        }
         else
-            return decodeResponseContent(buffer, callback);
+        {
+            if (decoder == null)
+                return plainResponseContent(exchange, buffer, callback);
+            else
+                return decodeResponseContent(buffer, callback);
+        }
     }
 
     private boolean plainResponseContent(HttpExchange exchange, ByteBuffer buffer, Callback callback)
@@ -1005,10 +1016,9 @@ public abstract class HttpReceiver
             responseFailure(failure);
         }
 
-        boolean setContentAndRunDemandCallbackIfSet(Content.Chunk chunk)
+        void setContentAndRunDemandCallbackIfSet(Content.Chunk chunk)
         {
             Runnable cb;
-            boolean doRun;
             try (AutoLock ignore = lock.lock())
             {
                 if (this.chunk != null)
@@ -1016,13 +1026,11 @@ public abstract class HttpReceiver
                 this.chunk = chunk;
 
                 cb = demandCallback;
-                doRun = cb != null;
-                if (doRun)
+                if (cb != null)
                     demandCallback = null;
             }
-            if (doRun)
+            if (cb != null)
                 cb.run();  // TODO avoid stack overflow
-            return doRun;
         }
     }
 }
