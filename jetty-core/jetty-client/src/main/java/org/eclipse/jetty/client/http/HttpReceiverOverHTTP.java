@@ -15,6 +15,8 @@ package org.eclipse.jetty.client.http;
 
 import java.io.EOFException;
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 
 import org.eclipse.jetty.client.HttpClient;
@@ -42,6 +44,8 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
 {
     private static final Logger LOG = LoggerFactory.getLogger(HttpReceiverOverHTTP.class);
 
+    private final AtomicBoolean firstContent = new AtomicBoolean(true);
+    private final AtomicReference<Runnable> contentActionRef = new AtomicReference<>();
     private final LongAdder inMessages = new LongAdder();
     private final HttpParser parser;
     private final RetainableByteBufferPool retainableByteBufferPool;
@@ -149,6 +153,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
         return upgradeBuffer;
     }
 
+
     private void process()
     {
         HttpConnectionOverHTTP connection = getHttpConnection();
@@ -160,6 +165,9 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                 // Always parse even empty buffers to advance the parser.
                 if (parse())
                 {
+                    Runnable contentAction = contentActionRef.getAndSet(null);
+                    if (contentAction != null)
+                        contentAction.run();
                     // Return immediately, as this thread may be in a race
                     // with e.g. another thread demanding more content.
                     return;
@@ -341,7 +349,16 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
 
         RetainableByteBuffer networkBuffer = this.networkBuffer;
         networkBuffer.retain();
-        return !responseContent(exchange, Content.Chunk.from(buffer, false, networkBuffer), Callback.from(() -> {}, this::failAndClose));
+        if (firstContent.compareAndSet(true, false))
+        {
+            Runnable r = firstResponseContent(exchange, Content.Chunk.from(buffer, false, networkBuffer), Callback.from(() -> {}, this::failAndClose));
+            contentActionRef.set(r);
+            return true; // stop parsing
+        }
+        else
+        {
+            return !responseContent(exchange, Content.Chunk.from(buffer, false, networkBuffer), Callback.from(() -> {}, this::failAndClose));
+        }
     }
 
     @Override
@@ -417,6 +434,8 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
     {
         super.reset();
         parser.reset();
+        firstContent.set(true);
+        contentActionRef.set(null);
     }
 
     private void failAndClose(Throwable failure)

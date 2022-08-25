@@ -77,27 +77,14 @@ public abstract class HttpReceiver
     private final ContentListeners contentListeners = new ContentListeners();
     private final AsyncContent contentSource = new AsyncContent()
     {
-        private volatile boolean resumeAfterStall = false;
         @Override
-        protected Runnable stalled()
+        public Content.Chunk read()
         {
-            if (responseState.get() == ResponseState.TRANSIENT)
-            {
-                resumeAfterStall = true;
-                return null;
-            }
-            return HttpReceiver.this::receive;
-        }
-
-        @Override
-        public boolean hasDemand()
-        {
-            if (resumeAfterStall)
-            {
-                resumeAfterStall = false;
-                return true;
-            }
-            return super.hasDemand();
+            Content.Chunk chunk = super.read();
+            if (chunk != null)
+                return chunk;
+            HttpReceiver.this.receive();
+            return super.read();
         }
     };
     private final HttpChannel channel;
@@ -133,34 +120,6 @@ public abstract class HttpReceiver
             }
             if (LOG.isDebugEnabled())
                 LOG.debug("Response demand={}/{}, resume={} on {}", n, demand, resume, this);
-        }
-
-        if (resume)
-        {
-            if (decoder != null)
-                decoder.resume();
-            else
-                receive();
-        }
-    }
-
-    void demandStrictlyOne()
-    {
-        boolean resume = false;
-        try (AutoLock ignored = lock.lock())
-        {
-            if (demand == 1)
-                return;
-            if (demand > 1)
-                throw new IllegalStateException();
-            demand = 1;
-            if (stalled)
-            {
-                stalled = false;
-                resume = true;
-            }
-            if (LOG.isDebugEnabled())
-                LOG.debug("Response demand={}/{}, resume={} on {}", 1, demand, resume, this);
         }
 
         if (resume)
@@ -377,7 +336,7 @@ public abstract class HttpReceiver
         {
             if (updateResponseState(ResponseState.TRANSIENT, ResponseState.HEADERS))
             {
-                // Tell the parser to always advance to the content.
+                // Tell the parser to always advance either to the content or to the end of the response.
                 return true;
             }
         }
@@ -385,6 +344,12 @@ public abstract class HttpReceiver
         dispose();
         terminateResponse(exchange);
         return false;
+    }
+
+    protected Runnable firstResponseContent(HttpExchange exchange, Content.Chunk chunk, Callback callback)
+    {
+        contentSource.write(chunk, callback);
+        return () -> contentListeners.callContentSourceListener(exchange.getResponse());
     }
 
     /**
@@ -411,7 +376,6 @@ public abstract class HttpReceiver
             }
 
             contentSource.write(chunk, callback);
-            contentListeners.callContentSourceListener(exchange.getResponse());
 
             if (updateResponseState(ResponseState.TRANSIENT, ResponseState.CONTENT))
             {

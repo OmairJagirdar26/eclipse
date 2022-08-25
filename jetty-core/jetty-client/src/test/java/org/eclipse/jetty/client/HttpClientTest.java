@@ -1106,7 +1106,7 @@ public class HttpClientTest extends AbstractHttpClientServerTest
     @ArgumentsSource(ScenarioProvider.class)
     public void testContentSourceListener(Scenario scenario) throws Exception
     {
-        final int timeoutInMs = 5000_000;
+        final int timeoutInMs = 5000;
 
         start(scenario, new Handler.Processor()
         {
