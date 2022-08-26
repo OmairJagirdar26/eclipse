@@ -19,14 +19,10 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.LongUnaryOperator;
 
 import org.eclipse.jetty.client.api.Response;
 import org.eclipse.jetty.client.api.Result;
@@ -37,9 +33,7 @@ import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.io.content.AsyncContent;
 import org.eclipse.jetty.util.BufferUtil;
 import org.eclipse.jetty.util.Callback;
-import org.eclipse.jetty.util.MathUtils;
 import org.eclipse.jetty.util.component.Destroyable;
-import org.eclipse.jetty.util.thread.AutoLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,7 +66,6 @@ public abstract class HttpReceiver
 {
     private static final Logger LOG = LoggerFactory.getLogger(HttpReceiver.class);
 
-    private final AutoLock lock = new AutoLock();
     private final AtomicReference<ResponseState> responseState = new AtomicReference<>(ResponseState.IDLE);
     private final ContentListeners contentListeners = new ContentListeners();
     private final AsyncContent contentSource = new AsyncContent()
@@ -90,9 +83,6 @@ public abstract class HttpReceiver
     private final HttpChannel channel;
     private Decoder decoder;
     private Throwable failure;
-    private long demand;
-    private boolean stalled;
-
 
     protected HttpReceiver(HttpChannel channel)
     {
@@ -102,55 +92,6 @@ public abstract class HttpReceiver
     protected HttpChannel getHttpChannel()
     {
         return channel;
-    }
-
-    void demand(long n)
-    {
-        if (n <= 0)
-            throw new IllegalArgumentException("Invalid demand " + n);
-
-        boolean resume = false;
-        try (AutoLock ignored = lock.lock())
-        {
-            demand = MathUtils.cappedAdd(demand, n);
-            if (stalled)
-            {
-                stalled = false;
-                resume = true;
-            }
-            if (LOG.isDebugEnabled())
-                LOG.debug("Response demand={}/{}, resume={} on {}", n, demand, resume, this);
-        }
-
-        if (resume)
-        {
-            if (decoder != null)
-                decoder.resume();
-            else
-                receive();
-        }
-    }
-
-    protected long demand()
-    {
-        return demand(LongUnaryOperator.identity());
-    }
-
-    private long demand(LongUnaryOperator operator)
-    {
-        try (AutoLock ignored = lock.lock())
-        {
-            return demand = operator.applyAsLong(demand);
-        }
-    }
-
-    protected boolean hasDemandOrStall()
-    {
-        try (AutoLock ignored = lock.lock())
-        {
-            stalled = demand <= 0;
-            return !stalled;
-        }
     }
 
     protected HttpExchange getHttpExchange()
@@ -301,44 +242,30 @@ public abstract class HttpReceiver
         List<Response.ResponseListener> responseListeners = exchange.getConversation().getResponseListeners();
         notifier.notifyHeaders(responseListeners, response);
         contentListeners.reset(responseListeners);
-        if (!contentListeners.hasContentSourceListener())
-        {
-            contentListeners.notifyBeforeContent(response);
 
-            if (!contentListeners.isEmpty())
+        if (!contentListeners.isEmpty())
+        {
+            List<String> contentEncodings = response.getHeaders().getCSV(HttpHeader.CONTENT_ENCODING.asString(), false);
+            if (contentEncodings != null && !contentEncodings.isEmpty())
             {
-                List<String> contentEncodings = response.getHeaders().getCSV(HttpHeader.CONTENT_ENCODING.asString(), false);
-                if (contentEncodings != null && !contentEncodings.isEmpty())
+                for (ContentDecoder.Factory factory : getHttpDestination().getHttpClient().getContentDecoderFactories())
                 {
-                    for (ContentDecoder.Factory factory : getHttpDestination().getHttpClient().getContentDecoderFactories())
+                    for (String encoding : contentEncodings)
                     {
-                        for (String encoding : contentEncodings)
+                        if (factory.getEncoding().equalsIgnoreCase(encoding))
                         {
-                            if (factory.getEncoding().equalsIgnoreCase(encoding))
-                            {
-                                decoder = new Decoder(exchange, factory.newContentDecoder());
-                                break;
-                            }
+                            decoder = new Decoder(exchange, factory.newContentDecoder());
+                            break;
                         }
                     }
                 }
             }
-
-            if (updateResponseState(ResponseState.TRANSIENT, ResponseState.HEADERS))
-            {
-                boolean hasDemand = hasDemandOrStall();
-                if (LOG.isDebugEnabled())
-                    LOG.debug("Response headers hasDemand={} {}", hasDemand, response);
-                return hasDemand;
-            }
         }
-        else
+
+        if (updateResponseState(ResponseState.TRANSIENT, ResponseState.HEADERS))
         {
-            if (updateResponseState(ResponseState.TRANSIENT, ResponseState.HEADERS))
-            {
-                // Tell the parser to always advance either to the content or to the end of the response.
-                return true;
-            }
+            // Tell the parser to always advance either to the content or to the end of the response.
+            return true;
         }
 
         dispose();
@@ -348,8 +275,17 @@ public abstract class HttpReceiver
 
     protected Runnable firstResponseContent(HttpExchange exchange, Content.Chunk chunk, Callback callback)
     {
-        contentSource.write(chunk, callback);
-        return () -> contentListeners.callContentSourceListener(exchange.getResponse());
+        if (decoder == null)
+        {
+            contentSource.write(chunk, callback);
+        }
+        else
+        {
+            // TODO decode by wrapping content source with a decoding one here
+//            decoder.decode(buffer, c);
+            contentSource.write(chunk, callback);
+        }
+        return () -> contentListeners.notifyContent(exchange.getResponse());
     }
 
     /**
@@ -367,75 +303,22 @@ public abstract class HttpReceiver
         if (LOG.isDebugEnabled())
             LOG.debug("Response content {}{}{}", exchange.getResponse(), System.lineSeparator(), BufferUtil.toDetailString(chunk.getByteBuffer()));
 
-        if (contentListeners.hasContentSourceListener())
-        {
-            if (!updateResponseState(ResponseState.HEADERS, ResponseState.CONTENT, ResponseState.TRANSIENT))
-            {
-                callback.failed(new IllegalStateException("Invalid response state " + responseState));
-                return false;
-            }
-
-            contentSource.write(chunk, callback);
-
-            if (updateResponseState(ResponseState.TRANSIENT, ResponseState.CONTENT))
-            {
-                return contentSource.hasDemand();
-            }
-
-            dispose();
-            terminateResponse(exchange);
-            return false;
-        }
-        else
-        {
-            if (demand() <= 0)
-            {
-                callback.failed(new IllegalStateException("No demand for response content"));
-                return false;
-            }
-
-            Callback c = Callback.from(chunk::release, (x) ->
-            {
-                chunk.release();
-                callback.failed(x);
-            });
-            if (decoder == null)
-                return plainResponseContent(exchange, chunk.getByteBuffer(), c);
-            else
-                return decodeResponseContent(chunk.getByteBuffer(), c);
-        }
-    }
-
-    private boolean plainResponseContent(HttpExchange exchange, ByteBuffer buffer, Callback callback)
-    {
         if (!updateResponseState(ResponseState.HEADERS, ResponseState.CONTENT, ResponseState.TRANSIENT))
         {
             callback.failed(new IllegalStateException("Invalid response state " + responseState));
             return false;
         }
 
-        HttpResponse response = exchange.getResponse();
-        if (contentListeners.isEmpty())
-            callback.succeeded();
-        else
-            contentListeners.notifyContent(response, buffer, callback);
+        contentSource.write(chunk, callback);
 
         if (updateResponseState(ResponseState.TRANSIENT, ResponseState.CONTENT))
         {
-            boolean hasDemand = hasDemandOrStall();
-            if (LOG.isDebugEnabled())
-                LOG.debug("Response content {}, hasDemand={}", response, hasDemand);
-            return hasDemand;
+            return contentSource.hasDemand();
         }
 
         dispose();
         terminateResponse(exchange);
         return false;
-    }
-
-    private boolean decodeResponseContent(ByteBuffer buffer, Callback callback)
-    {
-        return decoder.decode(buffer, callback);
     }
 
     /**
@@ -555,20 +438,31 @@ public abstract class HttpReceiver
      * <p>
      * Either this method or {@link #reset()} is called.
      */
+    // TODO reconcile dispose(), dispose(Throwable), cleanup() and cleanup(Throwable)
     protected void dispose()
     {
+        dispose(null);
+    }
+
+    protected void dispose(Throwable x)
+    {
         assert responseState.get() != ResponseState.TRANSIENT;
-        cleanup();
+        cleanup(x);
     }
 
     private void cleanup()
+    {
+        cleanup(null);
+    }
+
+    private void cleanup(Throwable x)
     {
         contentListeners.clear();
         if (decoder != null)
             decoder.destroy();
         decoder = null;
-        demand = 0;
-        stalled = false;
+        if (x != null)
+            contentSource.fail(x);
     }
 
     public boolean abort(HttpExchange exchange, Throwable failure)
@@ -590,7 +484,7 @@ public abstract class HttpReceiver
         this.failure = failure;
 
         if (terminate)
-            dispose();
+            dispose(failure);
 
         HttpResponse response = exchange.getResponse();
         if (LOG.isDebugEnabled())
@@ -658,11 +552,10 @@ public abstract class HttpReceiver
     @Override
     public String toString()
     {
-        return String.format("%s@%x(rsp=%s,demand=%d,failure=%s)",
+        return String.format("%s@%x(rsp=%s,failure=%s)",
             getClass().getSimpleName(),
             hashCode(),
             responseState,
-            demand(),
             failure);
     }
 
@@ -707,26 +600,10 @@ public abstract class HttpReceiver
      */
     private class ContentListeners
     {
-        private final Map<Object, Long> demands = new ConcurrentHashMap<>();
-        private final List<Response.DemandedContentListener> listeners = new ArrayList<>(2);
-        private final AtomicBoolean contentSourceListenerCalled = new AtomicBoolean();
-        private Response.ContentSourceListener contentSourceListener;
-
-        public boolean hasContentSourceListener()
-        {
-            return contentSourceListener != null;
-        }
-
-        public void callContentSourceListener(HttpResponse response)
-        {
-            // The contentSourceListener should only be called once.
-            if (contentSourceListenerCalled.compareAndSet(false, true))
-                contentSourceListener.onContentSource(response, contentSource);
-        }
+        private final List<Response.ContentSourceListener> listeners = new ArrayList<>(1);
 
         private void clear()
         {
-            demands.clear();
             listeners.clear();
         }
 
@@ -735,10 +612,8 @@ public abstract class HttpReceiver
             clear();
             for (Response.ResponseListener listener : responseListeners)
             {
-                if (listener instanceof Response.DemandedContentListener)
-                    listeners.add((Response.DemandedContentListener)listener);
-                if (listener instanceof Response.ContentSourceListener csl)
-                    contentSourceListener = csl;
+                if (listener instanceof Response.ContentSourceListener)
+                    listeners.add((Response.ContentSourceListener)listener);
             }
         }
 
@@ -747,69 +622,10 @@ public abstract class HttpReceiver
             return listeners.isEmpty();
         }
 
-        private void notifyBeforeContent(HttpResponse response)
+        private void notifyContent(HttpResponse response)
         {
-            if (isEmpty())
-            {
-                // If no listeners, we want to proceed and consume any content.
-                HttpReceiver.this.demand(1);
-            }
-            else
-            {
-                ResponseNotifier notifier = getHttpDestination().getResponseNotifier();
-                notifier.notifyBeforeContent(response, this::demand, listeners);
-            }
-        }
-
-        private void notifyContent(HttpResponse response, ByteBuffer buffer, Callback callback)
-        {
-            HttpReceiver.this.demand(d -> d - 1);
             ResponseNotifier notifier = getHttpDestination().getResponseNotifier();
-            notifier.notifyContent(response, this::demand, buffer, callback, listeners);
-        }
-
-        private void demand(Object context, long value)
-        {
-            if (listeners.size() > 1)
-                accept(context, value);
-            else
-                HttpReceiver.this.demand(value);
-        }
-
-        private void accept(Object context, long value)
-        {
-            // Increment the demand for the given listener.
-            demands.merge(context, value, MathUtils::cappedAdd);
-
-            // Check if we have demand from all listeners.
-            if (demands.size() == listeners.size())
-            {
-                long minDemand = Long.MAX_VALUE;
-                for (Long demand : demands.values())
-                {
-                    if (demand < minDemand)
-                        minDemand = demand;
-                }
-                if (minDemand > 0)
-                {
-                    // We are going to demand for minDemand content
-                    // chunks, so decrement the listener's demand by
-                    // minDemand and remove those that have no demand left.
-                    Iterator<Map.Entry<Object, Long>> iterator = demands.entrySet().iterator();
-                    while (iterator.hasNext())
-                    {
-                        Map.Entry<Object, Long> entry = iterator.next();
-                        long newValue = entry.getValue() - minDemand;
-                        if (newValue == 0)
-                            iterator.remove();
-                        else
-                            entry.setValue(newValue);
-                    }
-
-                    // Demand more content chunks for all the listeners.
-                    HttpReceiver.this.demand(minDemand);
-                }
-            }
+            notifier.notifyContent(response, contentSource, listeners);
         }
     }
 
@@ -829,6 +645,8 @@ public abstract class HttpReceiver
             this.decoder = Objects.requireNonNull(decoder);
         }
 
+        // TODO restore
+/*
         private boolean decode(ByteBuffer encoded, Callback callback)
         {
             // Store the buffer to decode in case the
@@ -936,6 +754,7 @@ public abstract class HttpReceiver
             if (needInput)
                 receive();
         }
+*/
 
         @Override
         public void destroy()

@@ -193,10 +193,35 @@ public interface Response
     }
 
     /**
+     * Replacement for AsyncContentListener, intermediate between ContentListener and ContentSourceListener
+     */
+    interface SimpleContentSourceListener extends ContentSourceListener
+    {
+        void onContent(Response response, Runnable demander, Content.Chunk chunk);
+
+        default void onContentSource(Response response, Content.Source contentSource)
+        {
+            Content.Chunk chunk = contentSource.read();
+            if (chunk == null)
+            {
+                contentSource.demand(() -> onContentSource(response, contentSource));
+                return;
+            }
+            if (chunk instanceof Content.Chunk.Error error)
+            {
+                response.abort(error.getCause());
+                return;
+            }
+
+            onContent(response, () -> contentSource.demand(() -> onContentSource(response, contentSource)), chunk);
+        }
+    }
+
+    /**
      * Asynchronous listener for the response content events.
      */
     @Deprecated
-    interface DemandedContentListener extends ResponseListener
+    interface DemandedContentListener extends ContentSourceListener
     {
         /**
          * Callback method invoked before response content events.
@@ -226,6 +251,33 @@ public interface Response
          * @param callback the callback to call when the content is consumed
          */
         void onContent(Response response, LongConsumer demand, ByteBuffer content, Callback callback);
+
+        default void onContentSource(Response response, Content.Source contentSource)
+        {
+            onBeforeContent(response, demand -> contentSource.demand(() -> internalOnContentSource(response, contentSource)));
+        }
+
+        private void internalOnContentSource(Response response, Content.Source contentSource)
+        {
+            Content.Chunk chunk = contentSource.read();
+            if (chunk == null)
+            {
+                contentSource.demand(() -> internalOnContentSource(response, contentSource));
+                return;
+            }
+            if (chunk instanceof Content.Chunk.Error error)
+            {
+                response.abort(error.getCause());
+                return;
+            }
+
+            Callback callback = Callback.from(chunk::release, (x) ->
+            {
+                chunk.release();
+                response.abort(x);
+            });
+            onContent(response, demand -> contentSource.demand(() -> internalOnContentSource(response, contentSource)), chunk.getByteBuffer(), callback);
+        }
     }
 
     interface ContentSourceListener extends ResponseListener
