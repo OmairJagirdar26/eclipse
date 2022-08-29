@@ -275,16 +275,12 @@ public abstract class HttpReceiver
 
     protected Runnable firstResponseContent(HttpExchange exchange, Content.Chunk chunk, Callback callback)
     {
-        if (decoder == null)
-        {
-            contentSource.write(chunk, callback);
-        }
-        else
+        if (decoder != null)
         {
             // TODO decode by wrapping content source with a decoding one here
 //            decoder.decode(buffer, c);
-            contentSource.write(chunk, callback);
         }
+        contentSource.write(chunk, callback);
         return () -> contentListeners.notifyContent(exchange.getResponse());
     }
 
