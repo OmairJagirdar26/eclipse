@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.jetty.client.api.Response;
 import org.eclipse.jetty.client.api.Result;
+import org.eclipse.jetty.client.http.HttpReceiverOverHTTP;
 import org.eclipse.jetty.http.HttpField;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpStatus;
@@ -78,6 +79,13 @@ public abstract class HttpReceiver
                 return chunk;
             HttpReceiver.this.receive();
             return super.read();
+        }
+
+        @Override
+        protected Runnable stalled()
+        {
+            ((HttpReceiverOverHTTP)HttpReceiver.this).demand();
+            return null;
         }
     };
     private final HttpChannel channel;

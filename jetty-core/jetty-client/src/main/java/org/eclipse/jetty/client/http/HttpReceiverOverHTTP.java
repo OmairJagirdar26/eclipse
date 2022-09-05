@@ -93,7 +93,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
     {
         if (networkBuffer == null)
             acquireNetworkBuffer();
-        process();
+        parseAndFill();
     }
 
     private void acquireNetworkBuffer()
@@ -153,9 +153,21 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
         return upgradeBuffer;
     }
 
+    final AtomicBoolean demanding = new AtomicBoolean();
 
-    private void process()
+    public void demand()
     {
+        parseAndFill();
+        // TODO only CAS & call fillInterested if parseAndFill did not deliver any content
+        if (demanding.compareAndSet(false, true))
+        {
+            getHttpConnection().fillInterested();
+        }
+    }
+
+    private void parseAndFill()
+    {
+        demanding.getAndSet(false);
         HttpConnectionOverHTTP connection = getHttpConnection();
         EndPoint endPoint = connection.getEndPoint();
         try
@@ -198,7 +210,12 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                 {
                     assert networkBuffer.isEmpty();
                     releaseNetworkBuffer();
-                    fillInterested();
+
+                    // fillInterest must be automatically driven until the 1st content is delivered; at that time the
+                    // ContentSourceListener's read/demand loop takes over.
+                    if (firstContent.get())
+                        fillInterested();
+
                     return;
                 }
                 else

@@ -276,7 +276,14 @@ public interface Response
                 chunk.release();
                 response.abort(x);
             });
-            onContent(response, demand -> contentSource.demand(() -> internalOnContentSource(response, contentSource)), chunk.getByteBuffer(), callback);
+
+            LongConsumer longConsumerDemand;
+            if (chunk.isLast())
+                longConsumerDemand = demand -> {};
+            else
+                longConsumerDemand = demand -> contentSource.demand(() -> internalOnContentSource(response, contentSource));
+
+            onContent(response, longConsumerDemand, chunk.getByteBuffer(), callback);
         }
     }
 
