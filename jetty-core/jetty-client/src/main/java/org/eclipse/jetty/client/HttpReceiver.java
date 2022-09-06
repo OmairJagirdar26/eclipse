@@ -317,7 +317,9 @@ public abstract class HttpReceiver
 
         if (updateResponseState(ResponseState.TRANSIENT, ResponseState.CONTENT))
         {
-            return contentSource.hasDemand();
+            // Stop the parser immediately otherwise the parser may parse EOF and emit
+            // responseSuccess before the previously enqueued content gets read.
+            return false;
         }
 
         dispose();

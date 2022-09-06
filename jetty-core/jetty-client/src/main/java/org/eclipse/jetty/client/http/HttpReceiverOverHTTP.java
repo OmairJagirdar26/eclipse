@@ -157,16 +157,16 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
 
     public void demand()
     {
-        parseAndFill();
-        // TODO only CAS & call fillInterested if parseAndFill did not deliver any content
-        if (demanding.compareAndSet(false, true))
+        boolean contentParsed = parseAndFill();
+        if (!contentParsed && demanding.compareAndSet(false, true))
         {
             getHttpConnection().fillInterested();
         }
     }
 
-    private void parseAndFill()
+    private boolean parseAndFill()
     {
+        contentParsed = false;
         demanding.getAndSet(false);
         HttpConnectionOverHTTP connection = getHttpConnection();
         EndPoint endPoint = connection.getEndPoint();
@@ -182,7 +182,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                         contentAction.run();
                     // Return immediately, as this thread may be in a race
                     // with e.g. another thread demanding more content.
-                    return;
+                    return contentParsed;
                 }
 
                 // Connection may be closed in a parser callback.
@@ -191,7 +191,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                     if (LOG.isDebugEnabled())
                         LOG.debug("Closed {}", connection);
                     releaseNetworkBuffer();
-                    return;
+                    return contentParsed;
                 }
 
                 if (networkBuffer.isRetained())
@@ -208,7 +208,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                 }
                 else if (read == 0)
                 {
-                    assert networkBuffer.isEmpty();
+                    assert networkBuffer == null || networkBuffer.isEmpty();
                     releaseNetworkBuffer();
 
                     // fillInterest must be automatically driven until the 1st content is delivered; at that time the
@@ -216,13 +216,13 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                     if (firstContent.get())
                         fillInterested();
 
-                    return;
+                    return contentParsed;
                 }
                 else
                 {
                     releaseNetworkBuffer();
                     shutdown();
-                    return;
+                    return contentParsed;
                 }
             }
         }
@@ -232,6 +232,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                 LOG.debug("Error processing {}", endPoint, x);
             releaseNetworkBuffer();
             failAndClose(x);
+            return contentParsed;
         }
     }
 
@@ -356,6 +357,8 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
         return !responseHeaders(exchange);
     }
 
+    boolean contentParsed;
+
     @Override
     public boolean content(ByteBuffer buffer)
     {
@@ -366,6 +369,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
 
         RetainableByteBuffer networkBuffer = this.networkBuffer;
         networkBuffer.retain();
+        contentParsed = true;
         if (firstContent.compareAndSet(true, false))
         {
             Runnable r = firstResponseContent(exchange, Content.Chunk.from(buffer, false, networkBuffer), Callback.from(() -> {}, this::failAndClose));
