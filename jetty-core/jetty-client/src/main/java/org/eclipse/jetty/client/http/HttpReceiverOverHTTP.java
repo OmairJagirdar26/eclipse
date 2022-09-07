@@ -153,12 +153,10 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
         return upgradeBuffer;
     }
 
-    final AtomicBoolean demanding = new AtomicBoolean();
-
     public void demand()
     {
         boolean contentParsed = parseAndFill();
-        if (!contentParsed && demanding.compareAndSet(false, true))
+        if (!contentParsed && !getHttpConnection().isFillInterested())
         {
             getHttpConnection().fillInterested();
         }
@@ -167,7 +165,6 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
     private boolean parseAndFill()
     {
         contentParsed = false;
-        demanding.getAndSet(false);
         HttpConnectionOverHTTP connection = getHttpConnection();
         EndPoint endPoint = connection.getEndPoint();
         try
