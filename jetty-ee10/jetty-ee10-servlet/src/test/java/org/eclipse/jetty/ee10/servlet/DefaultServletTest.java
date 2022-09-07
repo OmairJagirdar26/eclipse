@@ -692,6 +692,22 @@ public class DefaultServletTest
             );
         }
 
+        scenarios.addScenario("""
+            GET /context/sekret/../../../ HTTP/1.1\r
+            Host: local\r
+            Connection: close\r
+            
+            """,
+            HttpStatus.BAD_REQUEST_400);
+
+        scenarios.addScenario("""
+            GET /context/sekret/../../ HTTP/1.1\r
+            Host: local\r
+            Connection: close\r
+            
+            """,
+            HttpStatus.NOT_FOUND_404);
+
         return scenarios.stream();
     }
 
