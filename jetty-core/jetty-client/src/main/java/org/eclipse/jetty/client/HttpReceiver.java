@@ -69,25 +69,7 @@ public abstract class HttpReceiver
 
     private final AtomicReference<ResponseState> responseState = new AtomicReference<>(ResponseState.IDLE);
     private final ContentListeners contentListeners = new ContentListeners();
-    private final AsyncContent contentSource = new AsyncContent()
-    {
-        @Override
-        public Content.Chunk read()
-        {
-            Content.Chunk chunk = super.read();
-            if (chunk != null)
-                return chunk;
-            HttpReceiver.this.receive();
-            return super.read();
-        }
-
-        @Override
-        protected Runnable stalled()
-        {
-            ((HttpReceiverOverHTTP)HttpReceiver.this).demand();
-            return null;
-        }
-    };
+    private AsyncContent contentSource;
     private final HttpChannel channel;
     private Decoder decoder;
     private Throwable failure;
@@ -95,6 +77,30 @@ public abstract class HttpReceiver
     protected HttpReceiver(HttpChannel channel)
     {
         this.channel = channel;
+        this.contentSource = newContentSource();
+    }
+
+    private AsyncContent newContentSource()
+    {
+        return new AsyncContent()
+        {
+            @Override
+            public Content.Chunk read()
+            {
+                Content.Chunk chunk = super.read();
+                if (chunk != null)
+                    return chunk;
+                HttpReceiver.this.receive();
+                return super.read();
+            }
+
+            @Override
+            protected Runnable stalled()
+            {
+                ((HttpReceiverOverHTTP)HttpReceiver.this).demand();
+                return null;
+            }
+        };
     }
 
     protected HttpChannel getHttpChannel()
@@ -288,6 +294,8 @@ public abstract class HttpReceiver
             // TODO decode by wrapping content source with a decoding one here
 //            decoder.decode(buffer, c);
         }
+        if (LOG.isDebugEnabled())
+            LOG.debug("firstResponseContent writing {}", chunk);
         contentSource.write(chunk, callback);
         return () -> contentListeners.notifyContent(exchange.getResponse());
     }
@@ -344,6 +352,8 @@ public abstract class HttpReceiver
             return false;
 
         responseState.set(ResponseState.IDLE);
+        if (LOG.isDebugEnabled())
+            LOG.debug("responseSuccess closing contentSource");
         contentSource.close();
 
         // Reset to be ready for another response.
@@ -469,6 +479,7 @@ public abstract class HttpReceiver
         decoder = null;
         if (x != null)
             contentSource.fail(x);
+        contentSource = newContentSource();
     }
 
     public boolean abort(HttpExchange exchange, Throwable failure)
