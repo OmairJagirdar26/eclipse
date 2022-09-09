@@ -90,14 +90,14 @@ public abstract class HttpReceiver
                 Content.Chunk chunk = super.read();
                 if (chunk != null)
                     return chunk;
-                HttpReceiver.this.receive();
+                ((HttpReceiverOverHTTP)HttpReceiver.this).read();
                 return super.read();
             }
 
             @Override
             protected Runnable stalled()
             {
-                ((HttpReceiverOverHTTP)HttpReceiver.this).demand();
+                ((HttpReceiverOverHTTP)HttpReceiver.this).stalled();
                 return null;
             }
         };
