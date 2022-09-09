@@ -13,6 +13,7 @@
 
 package org.eclipse.jetty.client;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
@@ -31,10 +32,10 @@ import org.eclipse.jetty.http.HttpField;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpStatus;
 import org.eclipse.jetty.io.Content;
-import org.eclipse.jetty.io.content.AsyncContent;
 import org.eclipse.jetty.util.BufferUtil;
 import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.component.Destroyable;
+import org.eclipse.jetty.util.thread.SerializedInvoker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,7 +70,7 @@ public abstract class HttpReceiver
 
     private final AtomicReference<ResponseState> responseState = new AtomicReference<>(ResponseState.IDLE);
     private final ContentListeners contentListeners = new ContentListeners();
-    private AsyncContent contentSource;
+    private ContentSource contentSource;
     private final HttpChannel channel;
     private Decoder decoder;
     private Throwable failure;
@@ -80,27 +81,112 @@ public abstract class HttpReceiver
         this.contentSource = newContentSource();
     }
 
-    private AsyncContent newContentSource()
+    private ContentSource newContentSource()
     {
-        return new AsyncContent()
-        {
-            @Override
-            public Content.Chunk read()
-            {
-                Content.Chunk chunk = super.read();
-                if (chunk != null)
-                    return chunk;
-                ((HttpReceiverOverHTTP)HttpReceiver.this).read();
-                return super.read();
-            }
+        return new ContentSource();
+    }
 
-            @Override
-            protected Runnable stalled()
+    private class ContentSource implements Content.Source, Closeable
+    {
+        private final SerializedInvoker invoker = new SerializedInvoker();
+        private volatile Content.Chunk currentChunk;
+        private volatile Callback currentChunkCallback;
+        private volatile Runnable demandCallback;
+
+        @Override
+        public Content.Chunk read()
+        {
+            Content.Chunk chunk = consumeCurrentChunk();
+            if (chunk != null)
+                return chunk;
+            ((HttpReceiverOverHTTP)HttpReceiver.this).read();
+            chunk = consumeCurrentChunk();
+            return chunk;
+        }
+
+        public void write(Content.Chunk chunk, Callback callback)
+        {
+            if (chunk == null || callback == null)
+                throw new IllegalArgumentException();
+            if (currentChunk != null)
             {
-                ((HttpReceiverOverHTTP)HttpReceiver.this).stalled();
-                return null;
+                callback.failed(new IOException("cannot enqueue chunk: " + chunk + "; currently enqueued: " + currentChunk));
+                return;
             }
-        };
+            currentChunk = chunk;
+            currentChunkCallback = callback;
+            if (demandCallback != null)
+                invoker.run(this::invokeDemandCallback);
+        }
+
+        public void close()
+        {
+            if (currentChunk != null)
+            {
+                currentChunkCallback.failed(new IOException("cannot close; currently enqueued: " + currentChunk));
+                return;
+            }
+            currentChunk = Content.Chunk.EOF;
+            currentChunkCallback = Callback.NOOP;
+        }
+
+        private Content.Chunk consumeCurrentChunk()
+        {
+            if (currentChunk != null)
+            {
+                Content.Chunk rc = currentChunk;
+                if (!(rc instanceof Content.Chunk.Error))
+                {
+                    currentChunk = currentChunk.isLast() ? Content.Chunk.EOF : null;
+                    currentChunkCallback = Callback.NOOP;
+                }
+                return rc;
+            }
+            return null;
+        }
+
+        @Override
+        public void demand(Runnable demandCallback)
+        {
+            if (demandCallback == null)
+                throw new IllegalArgumentException();
+            if (this.demandCallback != null)
+                throw new IllegalStateException();
+            this.demandCallback = demandCallback;
+            if (currentChunk != null)
+                invoker.run(this::invokeDemandCallback);
+            else
+                ((HttpReceiverOverHTTP)HttpReceiver.this).stalled();
+        }
+
+        private void invokeDemandCallback()
+        {
+            Runnable demandCallback = this.demandCallback;
+            this.demandCallback = null;
+            if (demandCallback != null)
+            {
+                try
+                {
+                    demandCallback.run();
+                }
+                catch (Throwable x)
+                {
+                    fail(x);
+                }
+            }
+        }
+
+        @Override
+        public void fail(Throwable failure)
+        {
+            if (currentChunk != null)
+            {
+                currentChunk.release();
+                currentChunkCallback.failed(failure);
+            }
+            currentChunk = Content.Chunk.from(failure);
+            currentChunkCallback = Callback.NOOP;
+        }
     }
 
     protected HttpChannel getHttpChannel()
