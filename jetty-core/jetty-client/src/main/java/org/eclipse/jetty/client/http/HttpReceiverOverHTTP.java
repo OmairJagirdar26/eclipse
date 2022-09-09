@@ -92,15 +92,30 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
     @Override
     public void receive()
     {
-        // This method is called until the ContentSourceListener.onContentSource() loop gets started;
-        // which is why it must register for fill interest if parseAndFill() filled 0 bytes.
-        // Once the ContentSourceListener.onContentSource() method is called, its read/demand loop
-        // takes over and this method isn't called anymore.
+        // This method is the callback of fill interest.
+        // As such, it is called until the ContentSourceListener.onContentSource() loop gets started;
+        // meaning firstContent is false and it must register for fill interest if no filling was done
+        // until onContentSource() gets called.
+        // Once onContentSource() gets called, firstContent is true and it must not register for fill interest
+        // if content was generated, but must if no content was generated.
+
         if (networkBuffer == null)
             acquireNetworkBuffer();
-        parseAndFill();
-        if (networkBuffer == null && !shutdown)
-            fillInterested();
+        boolean contentGenerated = parseAndFill();
+        Runnable contentAction = contentActionRef.getAndSet(null);
+        if (contentAction != null)
+            contentAction.run(); // start onContentSource loop
+
+        if (firstContent.get())
+        {
+            if (networkBuffer == null)
+                fillInterestedIfNeeded(); // the contentAction may already have registered for fill interest
+        }
+        else
+        {
+            if (!contentGenerated)
+                fillInterestedIfNeeded();
+        }
     }
 
     public void read()
@@ -197,9 +212,6 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                 // Always parse even empty buffers to advance the parser.
                 if (parse())
                 {
-                    Runnable contentAction = contentActionRef.getAndSet(null);
-                    if (contentAction != null)
-                        contentAction.run();
                     // Return immediately, as this thread may be in a race
                     // with e.g. another thread demanding more content.
                     return contentGenerated;
