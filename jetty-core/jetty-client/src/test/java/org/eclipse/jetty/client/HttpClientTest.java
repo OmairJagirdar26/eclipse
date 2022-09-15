@@ -1114,7 +1114,7 @@ public class HttpClientTest extends AbstractHttpClientServerTest
             public void process(org.eclipse.jetty.server.Request request, org.eclipse.jetty.server.Response response, Callback callback)
             {
                 response.write(false, ByteBuffer.wrap("hello1".getBytes(UTF_8)),
-                    Callback.from(()-> response.write(true, ByteBuffer.wrap("hello2".getBytes(UTF_8)), callback)));
+                    Callback.from(() -> response.write(true, ByteBuffer.wrap("hello2".getBytes(UTF_8)), callback)));
             }
         });
 
