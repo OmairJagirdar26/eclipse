@@ -13,7 +13,6 @@
 
 package org.eclipse.jetty.client;
 
-import java.io.Closeable;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
@@ -32,6 +31,7 @@ import org.eclipse.jetty.http.HttpField;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpStatus;
 import org.eclipse.jetty.io.Content;
+import org.eclipse.jetty.io.content.ContentSourceTransformer;
 import org.eclipse.jetty.util.BufferUtil;
 import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.component.Destroyable;
@@ -70,9 +70,8 @@ public abstract class HttpReceiver
 
     private final AtomicReference<ResponseState> responseState = new AtomicReference<>(ResponseState.IDLE);
     private final ContentListeners contentListeners = new ContentListeners();
-    private ContentSource contentSource;
+    private ReceiverContentSource contentSource;
     private final HttpChannel channel;
-    private Decoder decoder;
     private Throwable failure;
 
     protected HttpReceiver(HttpChannel channel)
@@ -81,12 +80,80 @@ public abstract class HttpReceiver
         this.contentSource = newContentSource();
     }
 
-    private ContentSource newContentSource()
+    private ReceiverContentSource newContentSource()
     {
         return new ContentSource();
     }
 
-    private class ContentSource implements Content.Source, Closeable
+    private interface ReceiverContentSource extends Content.Source
+    {
+        void write(Content.Chunk chunk, Callback callback);
+
+        void close();
+    }
+
+    private static class DecodingContentSource extends ContentSourceTransformer implements ReceiverContentSource
+    {
+        private final ContentSource _rawSource;
+        private final ContentDecoder _decoder;
+        private Content.Chunk _chunk;
+
+        public DecodingContentSource(ContentSource rawSource, ContentDecoder decoder)
+        {
+            super(rawSource);
+            _rawSource = rawSource;
+            _decoder = decoder;
+        }
+
+        @Override
+        public void write(Content.Chunk chunk, Callback callback)
+        {
+            _rawSource.write(chunk, callback);
+        }
+
+        @Override
+        public void close()
+        {
+            _rawSource.close();
+            _chunk.release();
+        }
+
+        @Override
+        protected Content.Chunk transform(Content.Chunk inputChunk)
+        {
+            boolean retain = _chunk == null;
+            if (_chunk == null)
+                _chunk = inputChunk;
+            if (_chunk == null)
+                return null;
+            if (_chunk instanceof Content.Chunk.Error)
+                return _chunk;
+            if (_chunk.isLast() && !_chunk.hasRemaining())
+                return Content.Chunk.EOF;
+
+            // Retain the input chunk because its ByteBuffer will be referenced by the Inflater.
+            if (retain)
+                _chunk.retain();
+            ByteBuffer decodedBuffer = _decoder.decode(_chunk.getByteBuffer());
+
+            if (BufferUtil.hasContent(decodedBuffer))
+            {
+                // The decoded ByteBuffer is a transformed "copy" of the
+                // compressed one, so it has its own reference counter.
+                return Content.Chunk.from(decodedBuffer, _chunk.isLast() && !_chunk.hasRemaining(), _decoder::release);
+            }
+            else
+            {
+                // Could not decode more from this chunk, release it.
+                Content.Chunk result = _chunk.isLast() ? Content.Chunk.EOF : null;
+                _chunk.release();
+                _chunk = null;
+                return result;
+            }
+        }
+    }
+
+    private class ContentSource implements ReceiverContentSource
     {
         private final SerializedInvoker invoker = new SerializedInvoker();
         private volatile Content.Chunk currentChunk;
@@ -354,7 +421,7 @@ public abstract class HttpReceiver
                     {
                         if (factory.getEncoding().equalsIgnoreCase(encoding))
                         {
-                            decoder = new Decoder(exchange, factory.newContentDecoder());
+                            contentSource = new DecodingContentSource((ContentSource)contentSource, factory.newContentDecoder());
                             break;
                         }
                     }
@@ -375,11 +442,6 @@ public abstract class HttpReceiver
 
     protected Runnable firstResponseContent(HttpExchange exchange, Content.Chunk chunk, Callback callback)
     {
-        if (decoder != null)
-        {
-            // TODO decode by wrapping content source with a decoding one here
-//            decoder.decode(buffer, c);
-        }
         if (LOG.isDebugEnabled())
             LOG.debug("firstResponseContent writing {}", chunk);
         contentSource.write(chunk, callback);
@@ -560,9 +622,6 @@ public abstract class HttpReceiver
     private void cleanup(Throwable x)
     {
         contentListeners.clear();
-        if (decoder != null)
-            decoder.destroy();
-        decoder = null;
         if (x != null)
             contentSource.fail(x);
         contentSource = newContentSource();
