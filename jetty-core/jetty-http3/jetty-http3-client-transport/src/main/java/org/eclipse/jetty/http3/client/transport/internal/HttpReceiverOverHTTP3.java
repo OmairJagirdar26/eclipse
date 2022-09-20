@@ -25,7 +25,6 @@ import org.eclipse.jetty.http.MetaData;
 import org.eclipse.jetty.http3.api.Stream;
 import org.eclipse.jetty.http3.frames.HeadersFrame;
 import org.eclipse.jetty.http3.internal.HTTP3ErrorCode;
-import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.thread.Invocable;
 import org.slf4j.Logger;
@@ -126,8 +125,8 @@ public class HttpReceiverOverHTTP3 extends HttpReceiver implements Stream.Client
                         stream.reset(HTTP3ErrorCode.REQUEST_CANCELLED_ERROR.code(), x);
                 });
 
-                Content.Chunk chunk = Content.Chunk.from(byteBuffer, data.isLast(), data::release);
-                boolean proceed = responseContent(exchange, chunk, callback);
+                // TODO Stream.Data data is lost here
+                boolean proceed = responseContent(exchange, callback);
                 if (proceed)
                 {
                     if (data.isLast())

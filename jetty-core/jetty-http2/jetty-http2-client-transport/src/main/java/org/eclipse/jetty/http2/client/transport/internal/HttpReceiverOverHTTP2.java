@@ -38,7 +38,6 @@ import org.eclipse.jetty.http2.frames.ResetFrame;
 import org.eclipse.jetty.http2.internal.ErrorCode;
 import org.eclipse.jetty.http2.internal.HTTP2Channel;
 import org.eclipse.jetty.http2.internal.HTTP2Stream;
-import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.io.EndPoint;
 import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.thread.Invocable;
@@ -225,8 +224,8 @@ public class HttpReceiverOverHTTP2 extends HttpReceiver implements HTTP2Channel.
                         stream.reset(new ResetFrame(stream.getId(), ErrorCode.CANCEL_STREAM_ERROR.code), Callback.NOOP);
                 });
 
-                Content.Chunk chunk = Content.Chunk.from(byteBuffer, data.frame().isEndStream(), data::release);
-                boolean proceed = responseContent(exchange, chunk, callback);
+                // TODO Stream.Data data is lost here
+                boolean proceed = responseContent(exchange, callback);
                 if (proceed)
                 {
                     if (data.frame().isEndStream())

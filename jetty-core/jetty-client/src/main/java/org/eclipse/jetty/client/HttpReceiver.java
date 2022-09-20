@@ -87,7 +87,9 @@ public abstract class HttpReceiver
     private interface ReceiverContentSource extends Content.Source
     {
         void onDataAvailable(Callback callback);
+
         void close();
+
         boolean isClosed();
     }
 

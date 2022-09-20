@@ -124,10 +124,11 @@ public class HttpChannelOverFCGI extends HttpChannel
 
     protected boolean content(Content.Chunk chunk, Callback callback)
     {
+        // TODO Content.Chunk chunk is lost here
         idle.notIdle();
         HttpExchange exchange = getHttpExchange();
         if (exchange != null)
-            return receiver.responseContent(exchange, chunk, callback);
+            return receiver.responseContent(exchange, callback);
         callback.succeeded();
         return false;
     }
