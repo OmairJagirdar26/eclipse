@@ -55,7 +55,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
     private boolean unsolicited;
     private String method;
     private int status;
-    private boolean contentGenerated;
+    private Content.Chunk contentGenerated;
 
     public HttpReceiverOverHTTP(HttpChannelOverHTTP channel)
     {
@@ -93,49 +93,39 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
     public void receive()
     {
         // This method is the callback of fill interest.
-        // As such, it is called until the ContentSourceListener.onContentSource() loop gets started;
+        // As such, it is called repeatedly until the ContentSourceListener.onContentSource() loop gets started;
         // meaning firstContent is false and it must register for fill interest if no filling was done
         // until onContentSource() gets called.
-        // Once onContentSource() gets called, firstContent is true and it must not register for fill interest
-        // if content was generated, but must if no content was generated.
-
-        if (networkBuffer == null)
-            acquireNetworkBuffer();
-        boolean contentGenerated = parseAndFill();
-        Runnable contentAction = contentActionRef.getAndSet(null);
-        if (contentAction != null)
-            contentAction.run(); // start onContentSource loop
+        // Once onContentSource() gets called, firstContent is true and it must just notify that content may be generated.
 
         if (firstContent.get())
         {
             if (networkBuffer == null)
-                fillInterestedIfNeeded(); // the contentAction may already have registered for fill interest
+                acquireNetworkBuffer();
+            parseAndFill();
+            Runnable contentAction = contentActionRef.getAndSet(null);
+            if (contentAction != null)
+                contentAction.run(); // start onContentSource loop
+            if (firstContent.get() && networkBuffer == null)
+                fillInterestedIfNeeded();
         }
         else
         {
-            if (!contentGenerated)
-                fillInterestedIfNeeded();
+            notifyDataAvailable();
         }
     }
 
-    public void read()
+    public Content.Chunk read(boolean fillInterestIfNeeded)
     {
-        // This method is called by ContentSourceListener.onContentSource() loop's read() calls;
-        // so it must never register for fill interest.
-        if (networkBuffer == null)
-            acquireNetworkBuffer();
-        parseAndFill();
-    }
-
-    public void stalled()
-    {
-        // This method is called when a ContentSourceListener.onContentSource() loop's demand() call stalls;
-        // so it must register for fill interest.
+        Content.Chunk chunk = consumeContentGenerated();
+        if (chunk != null)
+            return chunk;
         if (networkBuffer == null)
             acquireNetworkBuffer();
         boolean contentGenerated = parseAndFill();
-        if (!contentGenerated)
+        if (!contentGenerated && fillInterestIfNeeded)
             fillInterestedIfNeeded();
+        return consumeContentGenerated();
     }
 
     private void acquireNetworkBuffer()
@@ -202,7 +192,6 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
      */
     private boolean parseAndFill()
     {
-        contentGenerated = false;
         HttpConnectionOverHTTP connection = getHttpConnection();
         EndPoint endPoint = connection.getEndPoint();
         try
@@ -214,7 +203,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                 {
                     // Return immediately, as this thread may be in a race
                     // with e.g. another thread demanding more content.
-                    return contentGenerated;
+                    return contentGenerated != null;
                 }
 
                 // Connection may be closed in a parser callback.
@@ -223,7 +212,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                     if (LOG.isDebugEnabled())
                         LOG.debug("Closed {}", connection);
                     releaseNetworkBuffer();
-                    return contentGenerated;
+                    return contentGenerated != null;
                 }
 
                 if (networkBuffer.isRetained())
@@ -242,13 +231,13 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                 {
                     assert networkBuffer.isEmpty();
                     releaseNetworkBuffer();
-                    return contentGenerated;
+                    return contentGenerated != null;
                 }
                 else
                 {
                     releaseNetworkBuffer();
                     shutdown();
-                    return contentGenerated;
+                    return contentGenerated != null;
                 }
             }
         }
@@ -258,8 +247,15 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
                 LOG.debug("Error processing {}", endPoint, x);
             releaseNetworkBuffer();
             failAndClose(x);
-            return contentGenerated;
+            return contentGenerated != null;
         }
+    }
+
+    private Content.Chunk consumeContentGenerated()
+    {
+        Content.Chunk chunk = this.contentGenerated;
+        this.contentGenerated = null;
+        return chunk;
     }
 
     /**
@@ -399,16 +395,20 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
 
         RetainableByteBuffer networkBuffer = this.networkBuffer;
         networkBuffer.retain();
-        contentGenerated = true;
+
+        if (contentGenerated != null)
+            throw new AssertionError();
+
+        contentGenerated = Content.Chunk.from(buffer, false, networkBuffer);
         if (firstContent.compareAndSet(true, false))
         {
-            Runnable r = firstResponseContent(exchange, Content.Chunk.from(buffer, false, networkBuffer), Callback.from(() -> {}, this::failAndClose));
+            Runnable r = firstResponseContent(exchange, Callback.from(() -> {}, this::failAndClose));
             contentActionRef.set(r);
             return true; // stop parsing
         }
         else
         {
-            return !responseContent(exchange, Content.Chunk.from(buffer, false, networkBuffer), Callback.from(() -> {}, this::failAndClose));
+            return !responseContent(exchange, Callback.from(() -> {}, this::failAndClose));
         }
     }
 
@@ -487,6 +487,7 @@ public class HttpReceiverOverHTTP extends HttpReceiver implements HttpParser.Res
         parser.reset();
         firstContent.set(true);
         contentActionRef.set(null);
+        contentGenerated = null;
     }
 
     private void failAndClose(Throwable failure)

@@ -21,7 +21,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.jetty.client.api.Response;
@@ -34,7 +33,6 @@ import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.io.content.ContentSourceTransformer;
 import org.eclipse.jetty.util.BufferUtil;
 import org.eclipse.jetty.util.Callback;
-import org.eclipse.jetty.util.component.Destroyable;
 import org.eclipse.jetty.util.thread.SerializedInvoker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,7 +49,7 @@ import org.slf4j.LoggerFactory;
  * is available</li>
  * <li>{@link #responseHeader(HttpExchange, HttpField)}, when an HTTP field is available</li>
  * <li>{@link #responseHeaders(HttpExchange)}, when all HTTP headers are available</li>
- * <li>{@link #responseContent(HttpExchange, Content.Chunk, Callback)}, when HTTP content is available</li>
+ * <li>{@link #responseContent(HttpExchange, Callback)}, when HTTP content is available</li>
  * <li>{@link #responseSuccess(HttpExchange)}, when the response is successful</li>
  * </ol>
  * At any time, subclasses may invoke {@link #responseFailure(Throwable)} to indicate that the response has failed
@@ -72,6 +70,7 @@ public abstract class HttpReceiver
     private final ContentListeners contentListeners = new ContentListeners();
     private ReceiverContentSource contentSource;
     private final HttpChannel channel;
+    private volatile boolean firstContent = true;
     private Throwable failure;
 
     protected HttpReceiver(HttpChannel channel)
@@ -87,16 +86,16 @@ public abstract class HttpReceiver
 
     private interface ReceiverContentSource extends Content.Source
     {
-        void write(Content.Chunk chunk, Callback callback);
-
+        void onDataAvailable(Callback callback);
         void close();
+        boolean isClosed();
     }
 
     private static class DecodingContentSource extends ContentSourceTransformer implements ReceiverContentSource
     {
         private final ContentSource _rawSource;
         private final ContentDecoder _decoder;
-        private Content.Chunk _chunk;
+        private volatile Content.Chunk _chunk;
 
         public DecodingContentSource(ContentSource rawSource, ContentDecoder decoder)
         {
@@ -106,16 +105,26 @@ public abstract class HttpReceiver
         }
 
         @Override
-        public void write(Content.Chunk chunk, Callback callback)
+        public void onDataAvailable(Callback callback)
         {
-            _rawSource.write(chunk, callback);
+            _rawSource.onDataAvailable(callback);
         }
 
         @Override
         public void close()
         {
             _rawSource.close();
-            _chunk.release();
+            if (_chunk != null)
+            {
+                _chunk.release();
+                _chunk = null;
+            }
+        }
+
+        @Override
+        public boolean isClosed()
+        {
+            return _rawSource.isClosed();
         }
 
         @Override
@@ -159,6 +168,7 @@ public abstract class HttpReceiver
         private volatile Content.Chunk currentChunk;
         private volatile Callback currentChunkCallback;
         private volatile Runnable demandCallback;
+        private volatile boolean closed;
 
         @Override
         public Content.Chunk read()
@@ -166,21 +176,20 @@ public abstract class HttpReceiver
             Content.Chunk chunk = consumeCurrentChunk();
             if (chunk != null)
                 return chunk;
-            ((HttpReceiverOverHTTP)HttpReceiver.this).read();
-            chunk = consumeCurrentChunk();
-            return chunk;
+            currentChunk = ((HttpReceiverOverHTTP)HttpReceiver.this).read(false);
+            return consumeCurrentChunk();
         }
 
-        public void write(Content.Chunk chunk, Callback callback)
+        @Override
+        public void onDataAvailable(Callback callback)
         {
-            if (chunk == null || callback == null)
+            if (callback == null)
                 throw new IllegalArgumentException();
             if (currentChunk != null)
             {
-                callback.failed(new IOException("cannot enqueue chunk: " + chunk + "; currently enqueued: " + currentChunk));
+                callback.failed(new IOException("cannot enqueue chunk currently enqueued: " + currentChunk));
                 return;
             }
-            currentChunk = chunk;
             currentChunkCallback = callback;
             if (demandCallback != null)
                 invoker.run(this::invokeDemandCallback);
@@ -195,10 +204,20 @@ public abstract class HttpReceiver
             }
             currentChunk = Content.Chunk.EOF;
             currentChunkCallback = Callback.NOOP;
+            closed = true;
+        }
+
+        @Override
+        public boolean isClosed()
+        {
+            return closed;
         }
 
         private Content.Chunk consumeCurrentChunk()
         {
+            if (closed)
+                return Content.Chunk.EOF;
+
             if (currentChunk != null)
             {
                 Content.Chunk rc = currentChunk;
@@ -220,10 +239,32 @@ public abstract class HttpReceiver
             if (this.demandCallback != null)
                 throw new IllegalStateException();
             this.demandCallback = demandCallback;
-            if (currentChunk != null)
-                invoker.run(this::invokeDemandCallback);
-            else
-                ((HttpReceiverOverHTTP)HttpReceiver.this).stalled();
+
+            invoker.run(this::meetDemand);
+        }
+
+        private void meetDemand()
+        {
+            while (true)
+            {
+                if (closed)
+                    currentChunk = Content.Chunk.EOF;
+                if (currentChunk != null)
+                {
+                    invoker.run(this::invokeDemandCallback);
+                    break;
+                }
+                else
+                {
+                    currentChunk = ((HttpReceiverOverHTTP)HttpReceiver.this).read(false);
+                    if (currentChunk == null)
+                    {
+                        currentChunk = ((HttpReceiverOverHTTP)HttpReceiver.this).read(true);
+                        if (currentChunk == null)
+                            return;
+                    }
+                }
+            }
         }
 
         private void invokeDemandCallback()
@@ -253,6 +294,7 @@ public abstract class HttpReceiver
             }
             currentChunk = Content.Chunk.from(failure);
             currentChunkCallback = Callback.NOOP;
+            closed = true;
         }
     }
 
@@ -440,12 +482,23 @@ public abstract class HttpReceiver
         return false;
     }
 
-    protected Runnable firstResponseContent(HttpExchange exchange, Content.Chunk chunk, Callback callback)
+    protected Runnable firstResponseContent(HttpExchange exchange, Callback callback)
     {
         if (LOG.isDebugEnabled())
-            LOG.debug("firstResponseContent writing {}", chunk);
-        contentSource.write(chunk, callback);
-        return () -> contentListeners.notifyContent(exchange.getResponse());
+            LOG.debug("firstResponseContent");
+        contentSource.onDataAvailable(callback);
+        firstContent = false;
+        return () ->
+        {
+            contentListeners.notifyContent(exchange.getResponse());
+            if (contentSource.isClosed())
+                reset();
+        };
+    }
+
+    protected void notifyDataAvailable()
+    {
+        contentSource.onDataAvailable(Callback.NOOP);
     }
 
     /**
@@ -454,14 +507,13 @@ public abstract class HttpReceiver
      * This method takes case of decoding the content, if necessary, and notifying {@link org.eclipse.jetty.client.api.Response.ContentListener}s.
      *
      * @param exchange the HTTP exchange
-     * @param chunk the response HTTP content chunk
      * @param callback the callback
      * @return whether the processing should continue
      */
-    protected boolean responseContent(HttpExchange exchange, Content.Chunk chunk, Callback callback)
+    protected boolean responseContent(HttpExchange exchange, Callback callback)
     {
         if (LOG.isDebugEnabled())
-            LOG.debug("Response content {}{}{}", exchange.getResponse(), System.lineSeparator(), BufferUtil.toDetailString(chunk.getByteBuffer()));
+            LOG.debug("Response content {}", exchange.getResponse());
 
         if (!updateResponseState(ResponseState.HEADERS, ResponseState.CONTENT, ResponseState.TRANSIENT))
         {
@@ -469,7 +521,7 @@ public abstract class HttpReceiver
             return false;
         }
 
-        contentSource.write(chunk, callback);
+        contentSource.onDataAvailable(callback);
 
         if (updateResponseState(ResponseState.TRANSIENT, ResponseState.CONTENT))
         {
@@ -505,7 +557,8 @@ public abstract class HttpReceiver
         contentSource.close();
 
         // Reset to be ready for another response.
-        reset();
+        if (firstContent)
+            reset();
 
         HttpResponse response = exchange.getResponse();
         if (LOG.isDebugEnabled())
@@ -625,6 +678,7 @@ public abstract class HttpReceiver
         if (x != null)
             contentSource.fail(x);
         contentSource = newContentSource();
+        firstContent = true;
     }
 
     public boolean abort(HttpExchange exchange, Throwable failure)
@@ -789,145 +843,5 @@ public abstract class HttpReceiver
             ResponseNotifier notifier = getHttpDestination().getResponseNotifier();
             notifier.notifyContent(response, contentSource, listeners);
         }
-    }
-
-    /**
-     * <p>Implements the decoding of content, producing decoded buffers only if there is demand for content.</p>
-     */
-    private class Decoder implements Destroyable
-    {
-        private final HttpExchange exchange;
-        private final ContentDecoder decoder;
-        private ByteBuffer encoded;
-        private Callback callback;
-
-        private Decoder(HttpExchange exchange, ContentDecoder decoder)
-        {
-            this.exchange = exchange;
-            this.decoder = Objects.requireNonNull(decoder);
-        }
-
-        // TODO restore
-/*
-        private boolean decode(ByteBuffer encoded, Callback callback)
-        {
-            // Store the buffer to decode in case the
-            // decoding produces multiple decoded buffers.
-            this.encoded = encoded;
-            this.callback = callback;
-
-            HttpResponse response = exchange.getResponse();
-            if (LOG.isDebugEnabled())
-                LOG.debug("Response content decoding {} with {}{}{}", response, decoder, System.lineSeparator(), BufferUtil.toDetailString(encoded));
-
-            boolean needInput = decode();
-            if (!needInput)
-                return false;
-
-            boolean hasDemand = hasDemandOrStall();
-            if (LOG.isDebugEnabled())
-                LOG.debug("Response content decoded, hasDemand={} {}", hasDemand, response);
-            return hasDemand;
-        }
-
-        private boolean decode()
-        {
-            while (true)
-            {
-                if (!updateResponseState(ResponseState.HEADERS, ResponseState.CONTENT, ResponseState.TRANSIENT))
-                {
-                    callback.failed(new IllegalStateException("Invalid response state " + responseState));
-                    return false;
-                }
-
-                DecodeResult result = decodeChunk();
-
-                if (updateResponseState(ResponseState.TRANSIENT, ResponseState.CONTENT))
-                {
-                    if (result == DecodeResult.NEED_INPUT)
-                        return true;
-                    if (result == DecodeResult.ABORT)
-                        return false;
-
-                    boolean hasDemand = hasDemandOrStall();
-                    if (LOG.isDebugEnabled())
-                        LOG.debug("Response content decoded chunk, hasDemand={} {}", hasDemand, exchange.getResponse());
-                    if (hasDemand)
-                        continue;
-                    else
-                        return false;
-                }
-
-                dispose();
-                terminateResponse(exchange);
-                return false;
-            }
-        }
-
-        private DecodeResult decodeChunk()
-        {
-            try
-            {
-                ByteBuffer buffer;
-                while (true)
-                {
-                    buffer = decoder.decode(encoded);
-                    if (buffer.hasRemaining())
-                        break;
-                    if (!encoded.hasRemaining())
-                    {
-                        callback.succeeded();
-                        encoded = null;
-                        callback = null;
-                        return DecodeResult.NEED_INPUT;
-                    }
-                }
-
-                ByteBuffer decoded = buffer;
-                HttpResponse response = exchange.getResponse();
-                if (LOG.isDebugEnabled())
-                    LOG.debug("Response content decoded chunk {}{}{}", response, System.lineSeparator(), BufferUtil.toDetailString(decoded));
-
-                contentListeners.notifyContent(response, decoded, Callback.from(() -> decoder.release(decoded), callback::failed));
-
-                return DecodeResult.DECODE;
-            }
-            catch (Throwable x)
-            {
-                callback.failed(x);
-                return DecodeResult.ABORT;
-            }
-        }
-
-        private void resume()
-        {
-            if (LOG.isDebugEnabled())
-                LOG.debug("Response content resume decoding {} with {}", exchange.getResponse(), decoder);
-
-            // The content and callback may be null
-            // if there is no initial content demand.
-            if (callback == null)
-            {
-                receive();
-                return;
-            }
-
-            boolean needInput = decode();
-            if (needInput)
-                receive();
-        }
-*/
-
-        @Override
-        public void destroy()
-        {
-            if (decoder instanceof Destroyable)
-                ((Destroyable)decoder).destroy();
-        }
-    }
-
-    private enum DecodeResult
-    {
-        DECODE, NEED_INPUT, ABORT
     }
 }
